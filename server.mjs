@@ -2,6 +2,7 @@ import express from "express";
 import crypto from "node:crypto";
 import { createBitChordAuth } from "./bitchord-addon-auth.mjs";
 import { tracks } from "./catalogue.mjs";
+import { searchTidalTracks } from "./tidal.mjs";
 
 // ===== Pengaturan =====
 const HOSTS = (process.env.ADDON_HOSTS || "localhost")
@@ -12,11 +13,11 @@ const MEDIA_SECRET = process.env.MEDIA_SECRET;
 const app = express();
 const bitchord = createBitChordAuth({ hosts: HOSTS });
 
-// ===== Manifest (DI SINI tempatnya) =====
+// ===== Manifest =====
 const MANIFEST = {
   id: "dev.layz.addon",
   name: "Layz Addon",
-  version: "1.0.0",
+  version: "1.1.0",
   resources: ["search", "stream"],
   bitchordAuth: true,
   allowDownloads: 0,
@@ -35,7 +36,6 @@ const MANIFEST = {
   ],
 };
 
-// ===== Logika pemilihan kualitas =====
 const LADDER = ["hires", "atmos", "lossless", "high", "low"];
 
 function pickRendition(track, quality, atmos) {
@@ -49,16 +49,43 @@ function pickRendition(track, quality, atmos) {
   return null;
 }
 
-function bestTier(track) {
-  const r = track.renditions;
-  if (r.hires || r.lossless)
-    return { format: "flac", audioQuality: "LOSSLESS" };
-  if (r.high) return { format: r.high.codec, audioQuality: "HIGH" };
-  return { format: "aac", audioQuality: "LOW" };
+function streamQualityOf(rendition) {
+  return {
+    format: rendition.codec,
+    label: rendition.label,
+    codec: rendition.codec,
+    container: rendition.container,
+    ...(rendition.sampleRate && { sampleRate: rendition.sampleRate }),
+    ...(rendition.bitDepth && { bitDepth: rendition.bitDepth }),
+    ...(rendition.bitrate && { bitrate: rendition.bitrate }),
+  };
 }
 
-// ===== URL media bertanda tangan (kedaluwarsa 30 menit) =====
+function normalize(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function matchLocalTrack(tidalTrack) {
+  const isrc = normalize(tidalTrack.isrc);
+  if (isrc) {
+    const byIsrc = tracks.find((track) => normalize(track.isrc) === isrc);
+    if (byIsrc) return byIsrc;
+  }
+  const title = normalize(tidalTrack.title);
+  const artist = normalize(tidalTrack.artist);
+  return tracks.find((track) =>
+    normalize(track.title) === title && normalize(track.artist) === artist
+  ) || null;
+}
+
+// ===== URL media bertanda tangan =====
 function signedMediaUrl(file, ttl = 1800) {
+  if (!MEDIA_SECRET) throw new Error("MEDIA_SECRET belum diatur");
   const exp = Math.floor(Date.now() / 1000) + ttl;
   const sig = crypto
     .createHmac("sha256", MEDIA_SECRET)
@@ -68,7 +95,7 @@ function signedMediaUrl(file, ttl = 1800) {
 }
 
 function mediaAllowed(file, exp, sig) {
-  if (!/^\d+$/.test(String(exp)) || Number(exp) < Date.now() / 1000)
+  if (!MEDIA_SECRET || !/^\d+$/.test(String(exp)) || Number(exp) < Date.now() / 1000)
     return false;
   const want = crypto
     .createHmac("sha256", MEDIA_SECRET)
@@ -91,46 +118,54 @@ app.get("/media/:file", (req, res) => {
 // ===== Semua route di bawah ini wajib lolos BitChord auth =====
 app.use(bitchord.express());
 
-app.get("/search", (req, res) => {
-  const q = String(req.query.q || "").toLowerCase();
-  const results = tracks
-    .filter((t) =>
-      [t.title, t.artist, t.album].join(" ").toLowerCase().includes(q),
-    )
-    .map((t) => ({
-      id: t.id,
-      title: t.title,
-      artist: t.artist,
-      album: t.album,
-      duration: t.duration,
-      artworkURL: t.artworkURL,
-      ...bestTier(t),
-    }));
-  res.set("Cache-Control", "no-store").json({ tracks: results });
+app.get("/search", async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  if (!q) return res.json({ tracks: [] });
+
+  try {
+    const tidalTracks = await searchTidalTracks(q);
+    const results = tidalTracks.flatMap((tidalTrack) => {
+      const localTrack = matchLocalTrack(tidalTrack);
+      // Hanya tampilkan hasil yang memang punya audio untuk diputar oleh addon.
+      if (!localTrack) return [];
+
+      return [{
+        id: localTrack.id,
+        title: tidalTrack.title || localTrack.title,
+        artist: tidalTrack.artist || localTrack.artist,
+        album: tidalTrack.album || localTrack.album,
+        duration: tidalTrack.duration ?? localTrack.duration,
+        artworkURL: tidalTrack.artworkURL || localTrack.artworkURL,
+        isrc: tidalTrack.isrc,
+        tidalId: tidalTrack.tidalId,
+        tidalQuality: tidalTrack.tidalQuality,
+        streamQuality: Object.values(localTrack.renditions).map(streamQualityOf),
+      }];
+    });
+
+    res.set("Cache-Control", "no-store").json({ tracks: results });
+  } catch (error) {
+    console.error("TIDAL search failed:", error.message);
+    res.status(502).json({ error: "tidal_unavailable", message: "Tidak dapat mengambil katalog TIDAL saat ini." });
+  }
 });
 
 app.get("/stream/:id", (req, res) => {
   const track = tracks.find((t) => t.id === req.params.id);
   if (!track) return res.sendStatus(404);
 
-  const r = pickRendition(
+  const rendition = pickRendition(
     track,
     String(req.query.quality || "hires"),
     String(req.query.atmos || "auto"),
   );
-  if (!r) return res.status(404).json({ error: "No rendition available" });
+  if (!rendition) return res.status(404).json({ error: "No rendition available" });
 
   res.set("Cache-Control", "no-store").json({
-    url: signedMediaUrl(r.file),
-    format: r.codec,
-    quality: r.label,
-    codec: r.codec,
-    container: r.container,
+    url: signedMediaUrl(rendition.file),
+    ...streamQualityOf(rendition),
     manifest: "none",
     encrypted: false,
-    ...(r.sampleRate && { sampleRate: r.sampleRate }),
-    ...(r.bitDepth && { bitDepth: r.bitDepth }),
-    ...(r.bitrate && { bitrate: r.bitrate }),
   });
 });
 

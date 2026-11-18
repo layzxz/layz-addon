@@ -62,8 +62,8 @@ function parseDuration(value) {
   return Math.round(Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0));
 }
 
-function relationshipResource(track, name, included) {
-  const linkage = track.relationships?.[name]?.data;
+function relationshipResource(resource, name, included) {
+  const linkage = resource.relationships?.[name]?.data;
   const first = Array.isArray(linkage) ? linkage[0] : linkage;
   if (!first) return null;
   return included.find((item) => item.type === first.type && item.id === first.id) || null;
@@ -83,57 +83,68 @@ function qualityFrom(track) {
   const bitDepth = attrs.bitDepth ?? metadata.bitDepth ?? null;
   const sampleRate = attrs.sampleRate ?? metadata.sampleRate ?? null;
   const format = attrs.format || metadata.format || null;
-  const quality = audioQuality
-    ? {
-        audioQuality,
-        ...(bitDepth != null && { bitDepth }),
-        ...(sampleRate != null && { sampleRate }),
-        ...(format && { format }),
-      }
-    : null;
-
-  return quality;
+  return audioQuality ? {
+    audioQuality,
+    ...(bitDepth != null && { bitDepth }),
+    ...(sampleRate != null && { sampleRate }),
+    ...(format && { format }),
+  } : null;
 }
 
-export async function searchTidalTracks(query, { countryCode = process.env.TIDAL_COUNTRY_CODE || "US", limit = 25 } = {}) {
-  const params = new URLSearchParams({
-    query,
+export async function searchTidalTracks(query, {
+  countryCode = process.env.TIDAL_COUNTRY_CODE || "ID",
+  limit = 25,
+} = {}) {
+  // TIDAL v2 search is addressed by the search query in the resource path.
+  // Nested relationship includes are not supported, so resolve track metadata
+  // in a second request using the returned track IDs.
+  const searchParams = new URLSearchParams({
     countryCode,
-    "page[limit]": String(Math.min(Math.max(Number(limit) || 25, 1), 50)),
-    include: "tracks,tracks.albums,tracks.artists,tracks.albums.coverArt",
+    include: "tracks",
   });
-  const payload = await tidalGet(`/searchResults?${params.toString()}`);
-  const included = payload.included || [];
-  const searchResult = (payload.data || []).find((item) => item.type === "searchResults") || payload.data?.[0];
-  if (!searchResult) return [];
+  const searchPayload = await tidalGet(
+    `/searchResults/${encodeURIComponent(query)}?${searchParams.toString()}`,
+  );
 
-  const linkedTracks = searchResult.relationships?.tracks?.data || [];
-  return linkedTracks
-    .map((link) => included.find((item) => item.type === link.type && item.id === link.id))
-    .filter(Boolean)
-    .map((track) => {
-      const attrs = track.attributes || {};
-      const album = relationshipResource(track, "albums", included);
-      const artist = relationshipResource(track, "artists", included);
-      const cover = album && relationshipResource(album, "coverArt", included);
-      const artistName = artist?.attributes?.name || attrs.artistName || attrs.artists?.[0]?.name || "";
-      const albumName = album?.attributes?.title || attrs.albumTitle || "";
-      const tidalQuality = qualityFrom(track);
+  const searchResult = (searchPayload.data || []).find((item) => item.type === "searchResults")
+    || searchPayload.data;
+  const linkedTracks = searchResult?.relationships?.tracks?.data || [];
+  const includedTracks = (searchPayload.included || []).filter((item) => item.type === "tracks");
+  const ids = linkedTracks.length
+    ? linkedTracks.slice(0, limit).map((item) => item.id)
+    : includedTracks.slice(0, limit).map((item) => item.id);
+  if (!ids.length) return [];
 
-      return {
-        tidalId: track.id,
-        isrc: attrs.isrc || null,
-        title: attrs.title || "",
-        artist: artistName,
-        album: albumName,
-        duration: parseDuration(attrs.duration),
-        artworkURL: artworkUrl(cover) || attrs.coverUrl || attrs.artworkUrl || null,
-        tidalQuality: tidalQuality || {
-          audioQuality: attrs.audioQuality || null,
-          bitDepth: attrs.bitDepth ?? null,
-          sampleRate: attrs.sampleRate ?? null,
-          format: attrs.format || null,
-        },
-      };
-    });
+  const trackParams = new URLSearchParams({
+    countryCode,
+    "filter[id]": ids.join(","),
+    include: "artists,albums",
+  });
+  const trackPayload = await tidalGet(`/tracks?${trackParams.toString()}`);
+  const included = trackPayload.included || [];
+  const tracks = (trackPayload.data || []).filter((item) => item.type === "tracks");
+
+  return tracks.map((track) => {
+    const attrs = track.attributes || {};
+    const album = relationshipResource(track, "albums", included);
+    const artist = relationshipResource(track, "artists", included);
+    const cover = album && relationshipResource(album, "coverArt", included);
+    const tidalQuality = qualityFrom(track);
+
+    return {
+      tidalId: String(track.id),
+      isrc: attrs.isrc || null,
+      title: attrs.title || "",
+      artist: artist?.attributes?.name || attrs.artistName || attrs.artists?.[0]?.name || "",
+      album: album?.attributes?.title || attrs.albumTitle || "",
+      duration: parseDuration(attrs.duration),
+      artworkURL: artworkUrl(cover) || attrs.coverUrl || attrs.artworkUrl || null,
+      tidalQuality: tidalQuality || {
+        audioQuality: attrs.audioQuality || null,
+        bitDepth: attrs.bitDepth ?? null,
+        sampleRate: attrs.sampleRate ?? null,
+        format: attrs.format || null,
+      },
+    };
+  });
 }

@@ -139,6 +139,10 @@ app.get("/search", async (req, res) => {
         isrc: tidalTrack.isrc,
         tidalId: tidalTrack.tidalId,
         tidalQuality: tidalTrack.tidalQuality,
+        ...(tidalTrack.tidalQuality?.audioQuality && { audioQuality: tidalTrack.tidalQuality.audioQuality }),
+        ...(tidalTrack.tidalQuality?.format && { format: tidalTrack.tidalQuality.format }),
+        ...(tidalTrack.tidalQuality?.bitDepth != null && { bitDepth: tidalTrack.tidalQuality.bitDepth }),
+        ...(tidalTrack.tidalQuality?.sampleRate != null && { sampleRate: tidalTrack.tidalQuality.sampleRate }),
         streamQuality: Object.values(localTrack.renditions).map(streamQualityOf),
       }];
     });
